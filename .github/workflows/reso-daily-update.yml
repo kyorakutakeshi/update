@@ -1,0 +1,196 @@
+# Reso daily auto-update
+#
+# Every day: merge the latest Equicord into this repo, build the standalone
+# desktop.asar (with src/userplugins + the custom src/main/patcher.ts), and
+# publish it as a release named "update <full commit hash>".
+#
+# Safety rules:
+#   - Nothing is released unless the build succeeds AND the patcher fix is
+#     present in both the source and the built patcher.js inside desktop.asar.
+#   - If Equicord's changes conflict with ours, the run fails and nothing is
+#     pushed or released (GitHub emails you about the failed run).
+#   - History is never force-pushed, so old clients can always compare their
+#     build hash against HEAD.
+#   - If there is nothing new since the last release, the run does nothing.
+
+name: Reso daily update
+
+on:
+    schedule:
+        - cron: "17 1 * * *" # 04:17 Riyadh time
+    workflow_dispatch:
+        inputs:
+            force:
+                description: "Release even if nothing changed since the last release"
+                type: boolean
+                default: false
+
+permissions:
+    contents: write
+
+concurrency:
+    group: reso-daily-update
+    cancel-in-progress: false
+
+env:
+    FORCE_COLOR: true
+    GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+    update:
+        name: Merge Equicord, build, release
+        runs-on: ubuntu-latest
+        timeout-minutes: 45
+
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  fetch-depth: 0
+
+            - name: Configure git
+              run: |
+                  git config user.name "Reso Auto Update"
+                  git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+            - name: Merge latest Equicord
+              id: merge
+              run: |
+                  git remote add upstream https://github.com/Equicord/Equicord.git
+                  git fetch --no-tags upstream main
+
+                  if git merge-base --is-ancestor upstream/main HEAD; then
+                      echo "Equicord has no new commits."
+                      echo "merged=false" >> "$GITHUB_OUTPUT"
+                  else
+                      UP_SHORT=$(git rev-parse --short upstream/main)
+                      if ! git merge --no-edit -m "Merge Equicord $UP_SHORT" upstream/main; then
+                          echo "::error::Equicord's changes conflict with ours in these files:"
+                          git diff --name-only --diff-filter=U | sed 's/^/::error::  /'
+                          git merge --abort
+                          echo "::error::Nothing was pushed or released. Resolve the merge locally, push, then run this workflow again."
+                          exit 1
+                      fi
+                      echo "merged=true" >> "$GITHUB_OUTPUT"
+                  fi
+
+            - name: Check the patcher fix is still in the source
+              run: |
+                  f=src/main/patcher.ts
+                  for marker in \
+                      'disable-renderer-backgrounding' \
+                      'disable-background-timer-throttling' \
+                      'disable-backgrounding-occluded-windows' \
+                      'UseEcoQoSForBackgroundProcess' \
+                      'backgroundThrottling = false'
+                  do
+                      if ! grep -qF "$marker" "$f"; then
+                          echo "::error::$f is missing the patcher fix ($marker). Not releasing."
+                          exit 1
+                      fi
+                  done
+                  echo "Patcher fix present in $f"
+
+            - name: Decide whether to release
+              id: decide
+              run: |
+                  LAST_NAME=$(gh release view --json name --jq .name 2>/dev/null || echo "")
+                  LAST_HASH="${LAST_NAME##* }"
+                  HEAD_HASH=$(git rev-parse HEAD)
+                  echo "Last release: '$LAST_NAME'"
+                  echo "HEAD:         $HEAD_HASH"
+
+                  if [ "$LAST_HASH" != "$HEAD_HASH" ]; then
+                      echo "release=true" >> "$GITHUB_OUTPUT"
+                  elif [ "${{ inputs.force }}" = "true" ]; then
+                      git commit --allow-empty -m "new update"
+                      echo "release=true" >> "$GITHUB_OUTPUT"
+                  else
+                      echo "Nothing new since the last release. Done."
+                      echo "release=false" >> "$GITHUB_OUTPUT"
+                  fi
+
+            # Userplugins live in the PRIVATE repo kyorakutakeshi/reso-userplugins.
+            # They are checked out into src/userplugins (which is gitignored here),
+            # so their source never lands in this public repo.
+            - name: Checkout private userplugins
+              if: steps.decide.outputs.release == 'true'
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  repository: kyorakutakeshi/reso-userplugins
+                  ssh-key: ${{ secrets.USERPLUGINS_DEPLOY_KEY }}
+                  path: src/userplugins
+                  persist-credentials: false
+
+            - name: Check userplugins are present
+              if: steps.decide.outputs.release == 'true'
+              run: |
+                  rm -rf src/userplugins/.git src/userplugins/.github
+                  COUNT=$(find src/userplugins -mindepth 1 -maxdepth 1 -type d | wc -l)
+                  echo "Userplugins found: $COUNT"
+                  if [ "$COUNT" -lt 1 ]; then
+                      echo "::error::No userplugins checked out. Not releasing a build without them."
+                      exit 1
+                  fi
+                  git check-ignore -q src/userplugins || { echo "::error::src/userplugins is not gitignored; refusing to continue."; exit 1; }
+
+            - name: Setup PNPM
+              if: steps.decide.outputs.release == 'true'
+              uses: pnpm/setup@fa36a5ef7dcdefc3a7cb25655c122e00cf6e636e # v3.1.2
+              with:
+                  runtime: node@v24
+                  require-lockfile: true
+
+            - name: Build standalone
+              if: steps.decide.outputs.release == 'true'
+              run: |
+                  pnpm buildStandalone
+                  test -s dist/desktop.asar
+
+            - name: Check the patcher fix is in the built desktop.asar
+              if: steps.decide.outputs.release == 'true'
+              run: |
+                  node -e '
+                      const asar = require("@electron/asar");
+                      const js = asar.extractFile("dist/desktop.asar", "patcher.js").toString();
+                      const markers = [
+                          "disable-renderer-backgrounding",
+                          "disable-background-timer-throttling",
+                          "disable-backgrounding-occluded-windows",
+                          "UseEcoQoSForBackgroundProcess",
+                          "backgroundThrottling"
+                      ];
+                      const missing = markers.filter(m => !js.includes(m));
+                      if (missing.length) {
+                          console.error("::error::Built patcher.js is missing the fix: " + missing.join(", "));
+                          process.exit(1);
+                      }
+                      const hash = require("child_process").execSync("git rev-parse HEAD").toString().trim();
+                      if (!js.includes(hash)) {
+                          console.error("::error::Built patcher.js does not contain HEAD hash " + hash);
+                          process.exit(1);
+                      }
+                      console.log("Built patcher.js has the fix and hash " + hash);
+                  '
+
+            - name: Push to main
+              if: steps.decide.outputs.release == 'true'
+              run: git push origin HEAD:main
+
+            - name: Publish release
+              if: steps.decide.outputs.release == 'true'
+              run: |
+                  HASH=$(git rev-parse HEAD)
+                  SHORT=$(git rev-parse --short=9 HEAD)
+                  {
+                      echo "new update"
+                      echo
+                      echo "Equicord: https://github.com/Equicord/Equicord/commit/$(git rev-parse upstream/main)"
+                      echo "Built: $(date -u '+%Y-%m-%d %H:%M UTC')"
+                  } > notes.md
+
+                  gh release create "update-$SHORT" dist/desktop.asar \
+                      --target "$HASH" \
+                      --title "update $HASH" \
+                      --notes-file notes.md \
+                      --latest
