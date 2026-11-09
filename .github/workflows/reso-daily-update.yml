@@ -65,13 +65,30 @@ jobs:
                       echo "merged=false" >> "$GITHUB_OUTPUT"
                   else
                       UP_SHORT=$(git rev-parse --short upstream/main)
-                      if ! git merge --no-edit -m "Merge Equicord $UP_SHORT" upstream/main; then
+                      git merge --no-commit --no-ff upstream/main || true
+
+                      # The Actions token is never allowed to push changes to .github/workflows,
+                      # so keep this repo's workflow files exactly as they are and leave out
+                      # Equicord's changes to theirs (this pipeline does not use them).
+                      git checkout HEAD -- .github/workflows
+                      git diff --name-only --diff-filter=U -- .github/workflows | while read -r f; do git rm -q -- "$f"; done
+                      git diff --cached --no-renames --name-only --diff-filter=A HEAD -- .github/workflows | while read -r f; do git rm -q -f -- "$f"; done
+
+                      CONFLICTS=$(git diff --name-only --diff-filter=U)
+                      if [ -n "$CONFLICTS" ]; then
                           echo "::error::Equicord's changes conflict with ours in these files:"
-                          git diff --name-only --diff-filter=U | sed 's/^/::error::  /'
+                          echo "$CONFLICTS" | sed 's/^/::error::  /'
                           git merge --abort
                           echo "::error::Nothing was pushed or released. Resolve the merge locally, push, then run this workflow again."
                           exit 1
                       fi
+                      if ! git diff --cached --quiet HEAD -- .github/workflows; then
+                          echo "::error::Workflow files would change with this merge. Nothing was pushed or released."
+                          git merge --abort
+                          exit 1
+                      fi
+
+                      git commit --no-edit -m "Merge Equicord $UP_SHORT"
                       echo "merged=true" >> "$GITHUB_OUTPUT"
                   fi
 
