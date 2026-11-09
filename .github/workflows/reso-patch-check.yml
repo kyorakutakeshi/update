@@ -1,0 +1,68 @@
+name: Reso patch check (temporary)
+
+on:
+    push:
+        branches:
+            - reso-patch-check
+
+permissions:
+    contents: read
+
+jobs:
+    report:
+        runs-on: ubuntu-latest
+        timeout-minutes: 40
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  repository: kyorakutakeshi/reso-userplugins
+                  ref: fix-2026-11-10
+                  ssh-key: ${{ secrets.USERPLUGINS_DEPLOY_KEY }}
+                  path: src/userplugins
+                  persist-credentials: false
+
+            - run: |
+                  rm -rf src/userplugins/.git src/userplugins/.github
+                  echo "Userplugins: $(find src/userplugins -mindepth 1 -maxdepth 1 | wc -l)"
+
+            - uses: pnpm/setup@fa36a5ef7dcdefc3a7cb25655c122e00cf6e636e # v3.1.2
+              with:
+                  runtime: node@v24
+                  require-lockfile: true
+
+            - run: pnpm install --frozen-lockfile --prefer-offline
+
+            - run: pnpm buildReporter
+
+            - name: Run reporter
+              timeout-minutes: 15
+              run: |
+                  set +e
+                  export PATH="$PWD/node_modules/.bin:$PATH"
+                  export CHROMIUM_BIN=/usr/bin/google-chrome
+                  node -e '
+                      const fs = require("fs");
+                      let s = fs.readFileSync("scripts/generateReport.ts", "utf8");
+                      const anchor = "case \"Finished test\":";
+                      if (!s.includes(anchor)) { console.error("anchor missing"); process.exit(1); }
+                      s = s.replace(anchor, anchor + " { const mods = await page.evaluate(\"(() => { const m = window.Vencord.Webpack.wreq.m; const o = {}; for (const id in m) o[id] = String(m[id]); return JSON.stringify(o); })()\"); (await import(\"node:fs\")).writeFileSync(process.env.DUMP_FILE as string, mods as string); }");
+                      fs.writeFileSync("scripts/dumpReport.ts", s);
+                  '
+                  mkdir -p dump
+                  esbuild scripts/dumpReport.ts > dist/report.mjs
+                  DUMP_FILE=dump/stable.json node dist/report.mjs > stable.md 2> stable.err &
+                  p1=$!
+                  DUMP_FILE=dump/canary.json USE_CANARY=true node dist/report.mjs > canary.md 2> canary.err &
+                  p2=$!
+                  wait $p1; echo "stable exit $?"
+                  wait $p2; echo "canary exit $?"
+                  echo "=====STABLE====="; cat stable.md
+                  echo "=====CANARY====="; cat canary.md
+                  echo "=====STABLE-ERR-TAIL====="; tail -n 60 stable.err
+                  echo "=====CANARY-ERR-TAIL====="; tail -n 60 canary.err
+                  ls -la dump
+                  gzip -9 -c dump/stable.json | base64 -w 60000 | sed "s/^/DUMPLINE /"
+                  echo DUMPEND
+
